@@ -1,0 +1,33 @@
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+pip_cache/
+hf_cache/
+temp/
+
+# media, source material and generated output (never committed)
+input/
+clips/
+final/
+final_100/
+output/
+shorts_work/
+camera_tracks/
+captions/
+edit_plans/
+edit_events/
+candidates/
+transcript.json
+windows.json
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.srt
+
+# builds
+dist/
+
+# per-machine app settings
+clip_studio_settings.json
