@@ -56,6 +56,17 @@ SAFE_LEFT = 90
 SAFE_RIGHT = OUT_W - 150       # 930
 SAFE_CX = (SAFE_LEFT + SAFE_RIGHT) // 2
 CAPTION_Y = 1250               # centre of the caption line (inside safe zone)
+CAPTION_Y_SPLIT = 960          # split screen: captions sit on the seam between the halves
+
+# optional add-ons (set by configure())
+SPLIT = False                  # speaker video top half, user clip bottom half
+SPLIT_ZOOM = 1.3               # tighter framing in the smaller top half
+BOTTOM_VIDEO = ""
+BOTTOM_DUR = 0.0
+BOTTOM_VARY = True             # each short uses a different part of the bottom clip
+MUSIC_FILE = ""                # pre-trimmed background music (wav)
+MUSIC_VOL = 0.18
+MUSIC_DUCK = True              # lower the music while people talk
 TITLE_TOP = 270
 
 TOP_TEXT = "4 THE BOYS"        # the only text above the captions
@@ -453,7 +464,8 @@ def write_ass(path, title, chunks):
     ]
 
     # hook title: pops in, stays for the whole short (inside the top safe area)
-    lines.append(
+    if title.strip():
+        lines.append(
         f"Dialogue: 1,{ass_time(0.0)},{ass_time(WINDOW)},Title,,0,0,0,,"
         "{\\fscx40\\fscy40\\t(0,160,\\fscx106\\fscy106)\\t(160,260,\\fscx100\\fscy100)}"
         + ass_escape(title.upper()))
@@ -566,9 +578,14 @@ def zoom_at(t, punches, shot_start, shot_end):
 # 5. RENDER
 # --------------------------------------------------
 
-def render(clip_path, ass_name, out_path, data, per_frame, punches, shots):
+def render(clip_path, ass_name, out_path, data, per_frame, punches, shots, index=0):
     fps, W, H = data["fps"], data["W"], data["H"]
-    base_crop_w = H * AS.OUT_ASPECT
+    # full 9:16 frame, or the top half (9:8) when split screen is on
+    top_h = OUT_H // 2 if SPLIT else OUT_H
+    aspect = OUT_W / top_h
+    vw0 = min(W, H * aspect)
+    vh0 = vw0 / aspect
+    base_zoom = SPLIT_ZOOM if SPLIT else 1.0
     n = len(per_frame["x"])
 
     # cut segments (camera cut or speaker cut): push-in restarts, zoom alternates
@@ -578,16 +595,42 @@ def render(clip_path, ass_name, out_path, data, per_frame, punches, shots):
         a, b = seg_bounds.get(sid, (f_i, f_i))
         seg_bounds[sid] = (min(a, f_i), max(b, f_i + 1))
 
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{OUT_W}x{OUT_H}", "-r", f"{fps}", "-i", "-",
-           "-i", os.path.basename(clip_path),
-           "-filter_complex", f"[0:v]unsharp=5:5:0.45:5:5:0,ass={ass_name}:fontsdir=fonts[v]",
-           "-map", "[v]", "-map", "1:a",
-           "-af", f"afade=t=in:st=0:d=0.04,afade=t=out:st={WINDOW - 0.15:.2f}:d=0.15,"
-                  "loudnorm=I=-14:TP=-1.5:LRA=11",
-           "-ar", "48000", "-c:a", "aac", "-b:a", "192k",
-           "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
-           "-profile:v", "high", "-t", f"{WINDOW:.3f}", "-movflags", "+faststart", out_path]
+    inputs = ["-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{OUT_W}x{top_h}", "-r", f"{fps}",
+              "-i", "-", "-i", os.path.basename(clip_path)]
+    fc, v, nxt = [], "[0:v]", 2
+
+    if SPLIT:
+        # bottom half: the user's clip, cover-cropped; looped if shorter, cut at WINDOW if longer
+        bot_h = OUT_H - top_h
+        off = (index * WINDOW) % BOTTOM_DUR if (BOTTOM_VARY and BOTTOM_DUR > WINDOW) else 0.0
+        inputs += ["-stream_loop", "-1", "-ss", f"{off:.3f}", "-i", BOTTOM_VIDEO]
+        fc.append(f"[{nxt}:v]scale={OUT_W}:{bot_h}:force_original_aspect_ratio=increase,"
+                  f"crop={OUT_W}:{bot_h},setsar=1,fps={fps}[bot]")
+        fc.append(f"{v}[bot]vstack=inputs=2:shortest=1[stk]")
+        v, nxt = "[stk]", nxt + 1
+    fc.append(f"{v}unsharp=5:5:0.45:5:5:0,ass={ass_name}:fontsdir=fonts[v]")
+
+    tail = (f"afade=t=in:st=0:d=0.04,afade=t=out:st={WINDOW - 0.15:.2f}:d=0.15,"
+            "loudnorm=I=-14:TP=-1.5:LRA=11")
+    if MUSIC_FILE:
+        # background music (pre-trimmed), looped to fill; ducks under speech if enabled
+        inputs += ["-stream_loop", "-1", "-i", MUSIC_FILE]
+        fmt = "aformat=sample_rates=48000:channel_layouts=stereo"
+        fc.append(f"[1:a]{fmt}" + (",asplit=2[sp][sc]" if MUSIC_DUCK else "[sp]"))
+        fc.append(f"[{nxt}:a]{fmt},volume={MUSIC_VOL:.3f}[mus]")
+        mus = "[mus]"
+        if MUSIC_DUCK:
+            fc.append("[mus][sc]sidechaincompress=threshold=0.015:ratio=12:attack=20:release=400[mdk]")
+            mus = "[mdk]"
+        fc.append(f"[sp]{mus}amix=inputs=2:duration=first:normalize=0,{tail}[a]")
+    else:
+        fc.append(f"[1:a]{tail}[a]")
+
+    cmd = (["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + inputs +
+           ["-filter_complex", ";".join(fc), "-map", "[v]", "-map", "[a]",
+            "-ar", "48000", "-c:a", "aac", "-b:a", "192k",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-profile:v", "high", "-t", f"{WINDOW:.3f}", "-movflags", "+faststart", out_path])
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, cwd=WORK, creationflags=NOWIN)
 
     cap = cv2.VideoCapture(clip_path)
@@ -599,15 +642,15 @@ def render(clip_path, ass_name, out_path, data, per_frame, punches, shots):
         t = f / fps
         sid = seg[f]
         a, b = seg_bounds[sid]
-        z = per_frame["z"][f] * zoom_at(t, punches, a / fps, b / fps)
+        z = per_frame["z"][f] * zoom_at(t, punches, a / fps, b / fps) * base_zoom
         if sid % 2 == 1:
             z *= CUT_ZOOM
-        vw, vh = base_crop_w / z, H / z
+        vw, vh = vw0 / z, vh0 / z
         cx = min(max(per_frame["x"][f], vw / 2), W - vw / 2)
         cy = min(max(per_frame["y"][f], vh / 2), H - vh / 2)
-        s = OUT_H / vh
-        M = np.float32([[s, 0, OUT_W / 2 - s * cx], [0, s, OUT_H / 2 - s * cy]])
-        out = cv2.warpAffine(frame, M, (OUT_W, OUT_H), flags=cv2.INTER_CUBIC,
+        s = top_h / vh
+        M = np.float32([[s, 0, OUT_W / 2 - s * cx], [0, s, top_h / 2 - s * cy]])
+        out = cv2.warpAffine(frame, M, (OUT_W, top_h), flags=cv2.INTER_CUBIC,
                              borderMode=cv2.BORDER_REPLICATE)
         proc.stdin.write(out.tobytes())
         f += 1
@@ -634,7 +677,7 @@ def build(cand, segs, total, windows):
     windows[cid]["output"] = out_path
 
 
-def build_window(cid, start, segs, out_path):
+def build_window(cid, start, segs, out_path, index=0):
     end = start + WINDOW
     clip_path = os.path.join(WORK, f"{cid}.mp4")
     extract(start, clip_path)
@@ -699,7 +742,7 @@ def build_window(cid, start, segs, out_path):
     punches = punch_events(rel)
     print(f"  punch-ins at: {[round(p[0], 2) for p in punches]}")
 
-    render(clip_path, ass_name, out_path, data, per_frame, punches, result["shots"])
+    render(clip_path, ass_name, out_path, data, per_frame, punches, result["shots"], index)
     print(f"  rendered {out_path}  ({probe_duration(out_path):.2f}s)")
     # the 40 s source window is only an intermediate
     for tmp in (clip_path,):
@@ -761,6 +804,16 @@ DEFAULT_CONFIG = {
     "caption_size": 100,
     "cut_on_speaker": True,
     "skip_existing": True,
+    "total_shorts": 0,              # >0 overrides chunks x per_chunk
+    # add-ons (all optional)
+    "music_path": "",
+    "music_start": 0.0,
+    "music_end": 0.0,               # 0 = to the end of the song
+    "music_volume": 0.18,
+    "music_duck": True,
+    "split_screen": False,
+    "bottom_video": "",
+    "bottom_vary": True,
     "whisper_model": "large-v3-turbo",
 }
 
@@ -909,6 +962,23 @@ def configure(cfg):
     WHISPER_MODEL = cfg.get("whisper_model", "small")
     global WHISPER_LANG
     WHISPER_LANG = LANGUAGES.get(cfg.get("language", "auto"), None)
+
+    # "Number of shorts" (friendly) -> 10 chunks x ceil(total/10), same plan (and file names)
+    # as v1.0's chunks x per-chunk for 100 = 10x10, 110 = 10x11, ...; extra slots are dropped
+    total = int(cfg.get("total_shorts") or 0)
+    if total > 0:
+        CHUNK_COUNT = min(10, total)
+        VIDEOS_PER_CHUNK = -(-total // CHUNK_COUNT)
+
+    global SPLIT, BOTTOM_VIDEO, BOTTOM_DUR, BOTTOM_VARY, MUSIC_FILE, MUSIC_VOL, MUSIC_DUCK, CAPTION_Y
+    SPLIT = bool(cfg.get("split_screen")) and bool(cfg.get("bottom_video"))
+    BOTTOM_VIDEO = cfg.get("bottom_video") or ""
+    BOTTOM_DUR = float(cfg.get("_bottom_dur") or 0.0)
+    BOTTOM_VARY = bool(cfg.get("bottom_vary", True))
+    MUSIC_FILE = cfg.get("_music_file") or ""
+    MUSIC_VOL = float(cfg.get("music_volume", 0.18))
+    MUSIC_DUCK = bool(cfg.get("music_duck", True))
+    CAPTION_Y = CAPTION_Y_SPLIT if SPLIT else 1250
     AS.CUT_ON_SPEAKER_CHANGE = bool(cfg["cut_on_speaker"])
 
 
@@ -930,7 +1000,7 @@ def _chunk_job(job):
     try:
         with contextlib.redirect_stdout(buf):
             segs = load_segments()
-            build_window(job["id"], job["start"], segs, out_path)
+            build_window(job["id"], job["start"], segs, out_path, job.get("index", 0))
             tmp = os.path.join(WORK, f"{job['id']}.mp4")
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -939,13 +1009,49 @@ def _chunk_job(job):
         return job["id"], False, f"{e!r}\n{buf.getvalue()[-800:]}"
 
 
-def run_pipeline(cfg, log=print, progress=None, should_stop=lambda: False, only=None):
-    """Whole process: transcript -> plan windows -> parallel render. Returns list of outputs."""
+def prepare_music(cfg, log):
+    """Trim the chosen song once (with short fades) into <work>/music_trim.wav."""
+    path = (cfg.get("music_path") or "").strip()
+    if not path:
+        return ""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Music file not found: {path}")
+    dur = probe_duration(path)
+    a = max(0.0, float(cfg.get("music_start") or 0.0))
+    b = float(cfg.get("music_end") or 0.0)
+    if b <= a or b > dur:
+        b = dur
+    seg = max(0.5, b - a)
+    fin, fout = min(0.3, seg / 4), min(0.6, seg / 4)
+    work = os.path.join(cfg["out_dir"], "_work")
+    os.makedirs(work, exist_ok=True)
+    dst = os.path.join(work, "music_trim.wav")
+    run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{a:.3f}", "-t", f"{seg:.3f}",
+         "-i", path, "-vn", "-ac", "2", "-ar", "48000",
+         "-af", f"afade=t=in:d={fin:.2f},afade=t=out:st={seg - fout:.2f}:d={fout:.2f}", dst])
+    log(f"Music: {os.path.basename(path)}  {a:.1f}s - {b:.1f}s  ({seg:.1f}s"
+        f"{', loops to fill each short' if seg < float(cfg['clip_seconds']) else ''})")
+    return dst
+
+
+def run_pipeline(cfg, log=print, progress=None, should_stop=lambda: False, only=None, test_one=False):
+    """Whole process: transcript -> plan windows -> parallel render. Returns list of outputs.
+    test_one=True renders a single short from the middle of the plan (quick preview)."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
     cfg = dict(DEFAULT_CONFIG, **cfg)
     if not os.path.exists(cfg["video"]):
         raise FileNotFoundError(cfg["video"])
     os.makedirs(cfg["out_dir"], exist_ok=True)
+
+    # optional add-ons
+    cfg["_music_file"] = prepare_music(cfg, log)
+    if cfg.get("split_screen"):
+        if not cfg.get("bottom_video") or not os.path.exists(cfg["bottom_video"]):
+            raise FileNotFoundError("Split screen is on but the bottom video was not found.")
+        cfg["_bottom_dur"] = probe_duration(cfg["bottom_video"])
+        log(f"Split screen: bottom video {os.path.basename(cfg['bottom_video'])} "
+            f"({cfg['_bottom_dur']:.1f}s, {'looped' if cfg['_bottom_dur'] < cfg['clip_seconds'] else 'trimmed'} "
+            f"to {cfg['clip_seconds']}s per short)")
 
     cfg["_transcript_json"] = prepare_transcript(
         cfg, log, (lambda d, t: progress(d, t, None, "transcribe")) if progress else None)
@@ -955,6 +1061,13 @@ def run_pipeline(cfg, log=print, progress=None, should_stop=lambda: False, only=
     segs = load_segments()
     total = probe_duration(MASTER)
     plan = chunk_windows(segs, total)
+    if int(cfg.get("total_shorts") or 0) > 0:
+        plan = plan[:int(cfg["total_shorts"])]
+    for k, j in enumerate(plan):
+        j["index"] = k
+    if test_one and plan:
+        only = {plan[len(plan) // 2]["id"]}
+        cfg["skip_existing"] = False
     with open(os.path.join(CHUNK_OUT, "plan.json"), "w", encoding="utf-8") as f:
         json.dump(plan, f, indent=1)
     todo = [j for j in plan if (not only or j["id"] in only)

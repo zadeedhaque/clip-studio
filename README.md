@@ -9,6 +9,13 @@ entirely on your PC: nothing is uploaded anywhere.
 (Hindi/Hinglish written in English letters) inside the Reels/TikTok/FB safe zone →
 punch-ins on laughs/applause → top text → 1080×1920 H.264, −14 LUFS.
 
+**Optional add-ons (v1.1):**
+- **Background music** — built-in trimmer (waveform with drag handles, play selection); mixed
+  under the speech at a chosen volume, auto-lowered while people talk, looped if shorter.
+- **Split screen** — speaker-tracked video in the top half, any video you choose in the bottom
+  half (cut to fit if longer, looped if shorter; optionally a different part per short).
+- Step-by-step interface with live layout preview and a **Test one short** button.
+
 ## Use the release (other PCs, no installs)
 
 1. Download **both** assets from the latest release: `ClipStudio-<ver>-app.zip` and
